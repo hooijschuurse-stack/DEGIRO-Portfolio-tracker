@@ -1,0 +1,18 @@
+# Geheim — bevat je API-keys, NOOIT committen
+config.json
+
+# Lokale staat / caches (niet nodig in de repo)
+ticker_mapping.json
+info_cache.json
+strategie.json
+doelgewichten.json
+watchlist.json
+koers_overrides.json
+macro_events.json
+
+# Persoonlijke data en omgeving
+*.csv
+!demo_account.csv
+.venv/
+__pycache__/
+streamlit_smoke.log
