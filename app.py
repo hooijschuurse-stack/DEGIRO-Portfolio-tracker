@@ -8,6 +8,7 @@ Daarna opent de app in je browser. Upload links je DEGIRO Transactions.csv
 Alle bedragen in de app zijn omgerekend naar EUR.
 """
 
+import hmac
 from pathlib import Path
 
 import pandas as pd
@@ -45,6 +46,7 @@ def _is_multiuser() -> bool:
 
 
 MULTIUSER = _is_multiuser()
+HUIDIGE_GEBRUIKER = None   # wordt gezet door het login-hek hieronder
 
 
 def _secret(naam, standaard=None):
@@ -52,6 +54,45 @@ def _secret(naam, standaard=None):
         return st.secrets.get(naam, standaard)
     except Exception:  # geen secrets.toml (lokaal)
         return standaard
+
+
+# ---------- Login (alleen actief als [logins] in Streamlit Secrets staat) ----------
+# Accounts komen uit Secrets (overleven een herstart; Streamlit Cloud wist de schijf).
+# Lokaal, zonder [logins], is er geen inlogscherm — dan werkt de app als vanouds.
+#   [logins]
+#   jan  = "wachtwoord123"
+#   piet = "geheim456"
+
+def _logins() -> dict | None:
+    lg = _secret("logins", None)
+    try:
+        return dict(lg) if lg else None
+    except Exception:
+        return None
+
+
+def _login_hek():
+    logins = _logins()
+    if not logins:
+        return None  # geen login geconfigureerd
+    if st.session_state.get("auth_user"):
+        return st.session_state["auth_user"]
+    st.title("📈 Portfolio Tracker")
+    st.markdown("#### Inloggen")
+    with st.form("login_form"):
+        u = st.text_input("Gebruikersnaam").strip()
+        p = st.text_input("Wachtwoord", type="password")
+        if st.form_submit_button("Inloggen", type="primary"):
+            verwacht = str(logins.get(u, ""))
+            if verwacht and hmac.compare_digest(verwacht, p):
+                st.session_state["auth_user"] = u
+                st.rerun()
+            else:
+                st.error("Onjuiste gebruikersnaam of wachtwoord.")
+    st.stop()
+
+
+HUIDIGE_GEBRUIKER = _login_hek()
 
 
 # Optie (a): jouw eigen Anthropic-key als backend-key (uit Streamlit Secrets),
@@ -76,11 +117,15 @@ _PREF_LEZERS = {
 _PREF_STANDAARD = {"watchlist": list}
 
 
+def _pref_key(naam: str) -> str:
+    return f"pref_{naam}_{HUIDIGE_GEBRUIKER}"
+
+
 def lees_pref(naam: str):
     """Persoonlijke voorkeur: session_state (multi-user) of JSON (lokaal)."""
     if MULTIUSER:
         maak = _PREF_STANDAARD.get(naam, dict)
-        return st.session_state.setdefault(f"pref_{naam}", maak())
+        return st.session_state.setdefault(_pref_key(naam), maak())
     return _PREF_LEZERS[naam]()
 
 
@@ -94,7 +139,7 @@ def pref_zet_strategie(isin: str, strategie: str) -> None:
 def pref_zet_doelgewichten(gewichten: dict) -> None:
     if MULTIUSER:
         schoon = {i: float(p) for i, p in gewichten.items() if p and float(p) > 0}
-        st.session_state["pref_doelgewichten"] = schoon
+        st.session_state[_pref_key("doelgewichten")] = schoon
     else:
         marktdata.zet_doelgewichten(gewichten)
 
@@ -400,6 +445,12 @@ def dividendgroei_tabel(holdings: tuple) -> pd.DataFrame:
 # ---------- Sidebar: CSV upload ----------
 
 st.sidebar.title("📈 Portfolio Tracker")
+if HUIDIGE_GEBRUIKER:
+    lc1, lc2 = st.sidebar.columns([2, 1])
+    lc1.caption(f"👤 Ingelogd als **{HUIDIGE_GEBRUIKER}**")
+    if lc2.button("Uitloggen"):
+        st.session_state.pop("auth_user", None)
+        st.rerun()
 st.sidebar.markdown(
     "Upload je **DEGIRO Account.csv**\n\n"
     "*(DEGIRO: Activiteit → Rekeningoverzicht → ruime periode → Exporteren → CSV)*\n\n"
