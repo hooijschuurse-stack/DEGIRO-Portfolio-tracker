@@ -46,6 +46,26 @@ def _is_multiuser() -> bool:
 
 MULTIUSER = _is_multiuser()
 
+
+def _secret(naam, standaard=None):
+    try:
+        return st.secrets.get(naam, standaard)
+    except Exception:  # geen secrets.toml (lokaal)
+        return standaard
+
+
+# Optie (a): jouw eigen Anthropic-key als backend-key (uit Streamlit Secrets),
+# zodat gebruikers de assistent kunnen gebruiken zonder zelf een key in te vullen.
+# Bescherm je rekening met een dag-limiet per gebruiker (per browsersessie).
+# Zet in Streamlit Secrets:  anthropic_api_key = "sk-ant-..."   en optioneel
+# chat_limiet_per_dag = 5 . Zonder backend-key valt de app terug op optie (b):
+# elke gebruiker vult zijn eigen key in (dan geen limiet — het is hun rekening).
+BACKEND_ANTHROPIC_KEY = str(_secret("anthropic_api_key", "") or "")
+try:
+    CHAT_LIMIET_PER_DAG = int(_secret("chat_limiet_per_dag", 5) or 5)
+except (TypeError, ValueError):
+    CHAT_LIMIET_PER_DAG = 5
+
 _PREF_LEZERS = {
     "strategie": marktdata.lees_strategie,
     "doelgewichten": marktdata.lees_doelgewichten,
@@ -1675,11 +1695,15 @@ with tab_assistent:
     st.caption("Stel vragen over je eigen portefeuille — bv. *welke positie drukt mijn "
                "rendement?*, *hoeveel dividend verwacht ik?*, *ben ik te geconcentreerd?* "
                "Antwoorden zijn gebaseerd op je geüploade data. Geen beleggingsadvies.")
-    _key = lees_pref("config").get("anthropic_api_key", "")
+    _eigen_key = lees_pref("config").get("anthropic_api_key", "")
+    _key = BACKEND_ANTHROPIC_KEY or _eigen_key
+    _via_backend = bool(BACKEND_ANTHROPIC_KEY)   # jouw key → dag-limiet toepassen
+
     if anthropic is None:
         st.error("De `anthropic`-bibliotheek is niet geïnstalleerd in de venv "
                  "(`.venv\\Scripts\\python.exe -m pip install anthropic`).")
     elif not _key:
+        # Optie (b): geen backend-key ingesteld → gebruiker vult eigen key in.
         st.info("Plak je Anthropic API-key (van console.anthropic.com) om de assistent te activeren.")
         with st.expander("🔑 API-key instellen"):
             k = st.text_input("Anthropic API-key", type="password", key="anthropic_key_in")
@@ -1688,13 +1712,26 @@ with tab_assistent:
                 st.success("Opgeslagen.")
                 st.rerun()
     else:
+        # Dag-limiet: alleen als we JOUW backend-key gebruiken (elke vraag kost jou geld).
+        vandaag = pd.Timestamp.today().date().isoformat()
+        teller = st.session_state.setdefault("chat_teller", {})
+        gebruikt = teller.get(vandaag, 0)
+        over_limiet = _via_backend and gebruikt >= CHAT_LIMIET_PER_DAG
+        if _via_backend:
+            st.caption(f"🎟️ Nog **{max(0, CHAT_LIMIET_PER_DAG - gebruikt)}** van "
+                       f"{CHAT_LIMIET_PER_DAG} vragen vandaag.")
+
         if "chat_historie" not in st.session_state:
             st.session_state.chat_historie = []
         for m in st.session_state.chat_historie:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
-        vraag = st.chat_input("Vraag iets over je portfolio…")
-        if vraag:
+
+        if over_limiet:
+            st.warning(f"Je hebt vandaag je {CHAT_LIMIET_PER_DAG} vragen gebruikt. "
+                       "Morgen zijn ze weer beschikbaar.")
+        vraag = st.chat_input("Vraag iets over je portfolio…", disabled=over_limiet)
+        if vraag and not over_limiet:
             st.session_state.chat_historie.append({"role": "user", "content": vraag})
             with st.chat_message("user"):
                 st.markdown(vraag)
@@ -1723,6 +1760,9 @@ with tab_assistent:
                 with st.chat_message("assistant"):
                     antwoord = st.write_stream(_stroom())
                 st.session_state.chat_historie.append({"role": "assistant", "content": antwoord})
+                if _via_backend:  # alleen jouw key telt mee voor de limiet
+                    teller[vandaag] = gebruikt + 1
+                    st.rerun()
             except Exception as e:
                 st.error(f"Kon de assistent niet bereiken: {e}")
         if st.session_state.chat_historie:
