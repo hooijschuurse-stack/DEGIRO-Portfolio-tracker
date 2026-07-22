@@ -418,6 +418,14 @@ if MULTIUSER:
                        "strategie, API-keys) leven alleen in deze browsersessie en worden "
                        "nergens opgeslagen.")
 
+st.sidebar.divider()
+st.sidebar.caption(
+    "⚠️ *Dit is een hulpmiddel, **geen beleggings- of fiscaal advies**. Cijfers zijn "
+    "indicatief en kunnen fouten bevatten (o.a. koersen via Yahoo Finance, ±15 min "
+    "vertraagd). Controleer belangrijke beslissingen zelf en raadpleeg zo nodig een "
+    "professional.*"
+)
+
 # ---------- Verwerken ----------
 
 # ISIN-wijzigingen en herboekingen opruimen (Shell, Eurocommercial, e.d.),
