@@ -3,3 +3,5 @@ pandas
 yfinance
 plotly
 anthropic
+sqlalchemy
+psycopg2-binary

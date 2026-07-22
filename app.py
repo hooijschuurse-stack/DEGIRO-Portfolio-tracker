@@ -9,6 +9,7 @@ Alle bedragen in de app zijn omgerekend naar EUR.
 """
 
 import hmac
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -107,6 +108,62 @@ try:
 except (TypeError, ValueError):
     CHAT_LIMIET_PER_DAG = 5
 
+
+# ---------- Database (optioneel — bewaart instellingen tussen bezoeken) ----------
+# Zet in Streamlit Secrets:  db_url = "postgresql://...pooler.supabase.com:6543/postgres"
+# (de POOLER-connectiestring van Supabase; de directe db.<ref>.supabase.co werkt niet
+# vanaf Streamlit Cloud). Zonder db_url draait alles per sessie zoals voorheen.
+# Eén tabel `user_settings(username, naam, data)` met per (gebruiker, instelling) een
+# JSON-blob. De tabel wordt automatisch aangemaakt — je hoeft geen SQL te draaien.
+
+@st.cache_resource(show_spinner=False)
+def _db_engine():
+    url = str(_secret("db_url", "") or "")
+    if not url:
+        return None
+    try:
+        from sqlalchemy import create_engine, text
+        if url.startswith("postgres") and "sslmode=" not in url:
+            url += ("&" if "?" in url else "?") + "sslmode=require"
+        eng = create_engine(url, pool_pre_ping=True)
+        with eng.begin() as c:
+            c.execute(text(
+                "create table if not exists user_settings ("
+                "username text not null, naam text not null, data text not null, "
+                "primary key (username, naam))"))
+        return eng
+    except Exception as e:  # nooit de app laten crashen op een DB-probleem
+        st.session_state["_db_fout"] = str(e)
+        return None
+
+
+DB = _db_engine()
+
+
+def db_lees(user: str, naam: str, standaard):
+    try:
+        from sqlalchemy import text
+        with DB.connect() as c:
+            r = c.execute(text("select data from user_settings "
+                               "where username=:u and naam=:n"),
+                          {"u": user, "n": naam}).fetchone()
+        return json.loads(r[0]) if r and r[0] else standaard
+    except Exception:
+        return standaard
+
+
+def db_schrijf(user: str, naam: str, data) -> None:
+    try:
+        from sqlalchemy import text
+        with DB.begin() as c:
+            c.execute(text(
+                "insert into user_settings (username, naam, data) "
+                "values (:u, :n, :d) "
+                "on conflict (username, naam) do update set data = :d"),
+                {"u": user, "n": naam, "d": json.dumps(data)})
+    except Exception:
+        pass
+
 _PREF_LEZERS = {
     "strategie": marktdata.lees_strategie,
     "doelgewichten": marktdata.lees_doelgewichten,
@@ -122,16 +179,29 @@ def _pref_key(naam: str) -> str:
 
 
 def lees_pref(naam: str):
-    """Persoonlijke voorkeur: session_state (multi-user) of JSON (lokaal)."""
+    """Persoonlijke voorkeur: DB (indien ingesteld) → session_state → JSON (lokaal)."""
     if MULTIUSER:
-        maak = _PREF_STANDAARD.get(naam, dict)
-        return st.session_state.setdefault(_pref_key(naam), maak())
+        key = _pref_key(naam)
+        if key not in st.session_state:
+            maak = _PREF_STANDAARD.get(naam, dict)
+            if DB and HUIDIGE_GEBRUIKER:
+                st.session_state[key] = db_lees(HUIDIGE_GEBRUIKER, naam, maak())
+            else:
+                st.session_state[key] = maak()
+        return st.session_state[key]
     return _PREF_LEZERS[naam]()
+
+
+def _pref_opslaan(naam: str) -> None:
+    """Schrijf de huidige sessiewaarde naar de DB (indien ingesteld)."""
+    if DB and HUIDIGE_GEBRUIKER:
+        db_schrijf(HUIDIGE_GEBRUIKER, naam, lees_pref(naam))
 
 
 def pref_zet_strategie(isin: str, strategie: str) -> None:
     if MULTIUSER:
         lees_pref("strategie")[isin] = strategie
+        _pref_opslaan("strategie")
     else:
         marktdata.zet_strategie(isin, strategie)
 
@@ -140,6 +210,7 @@ def pref_zet_doelgewichten(gewichten: dict) -> None:
     if MULTIUSER:
         schoon = {i: float(p) for i, p in gewichten.items() if p and float(p) > 0}
         st.session_state[_pref_key("doelgewichten")] = schoon
+        _pref_opslaan("doelgewichten")
     else:
         marktdata.zet_doelgewichten(gewichten)
 
@@ -151,6 +222,7 @@ def pref_zet_koers_override(isin: str, koers) -> None:
             ov.pop(isin, None)
         else:
             ov[isin] = koers
+        _pref_opslaan("koers_overrides")
     else:
         marktdata.zet_koers_override(isin, koers)
 
@@ -160,6 +232,7 @@ def pref_voeg_watchlist(ticker: str) -> None:
         wl = lees_pref("watchlist")
         if ticker not in wl:
             wl.append(ticker)
+        _pref_opslaan("watchlist")
     else:
         marktdata.voeg_watchlist(ticker)
 
@@ -169,6 +242,7 @@ def pref_verwijder_watchlist(ticker: str) -> None:
         wl = lees_pref("watchlist")
         if ticker in wl:
             wl.remove(ticker)
+        _pref_opslaan("watchlist")
     else:
         marktdata.verwijder_watchlist(ticker)
 
@@ -176,6 +250,7 @@ def pref_verwijder_watchlist(ticker: str) -> None:
 def pref_zet_config(sleutel: str, waarde: str) -> None:
     if MULTIUSER:
         lees_pref("config")[sleutel] = waarde
+        _pref_opslaan("config")
     else:
         marktdata.zet_config(sleutel, waarde)
 
@@ -485,9 +560,17 @@ if not transacties:
 st.sidebar.caption(f"{len(transacties)} transacties · {len(dividend_df)} dividenden "
                    f"({bron}).")
 if MULTIUSER:
-    st.sidebar.caption("🔒 **Gastmodus**: je CSV en instellingen (watchlist, doelgewichten, "
-                       "strategie, API-keys) leven alleen in deze browsersessie en worden "
-                       "nergens opgeslagen.")
+    if DB and HUIDIGE_GEBRUIKER:
+        st.sidebar.caption("☁️ Je instellingen (watchlist, doelgewichten, strategie) worden "
+                           "**bewaard** en staan er bij je volgende bezoek weer. Je geüploade "
+                           "CSV wordt nooit opgeslagen.")
+    else:
+        st.sidebar.caption("🔒 **Gastmodus**: je CSV en instellingen (watchlist, doelgewichten, "
+                           "strategie, API-keys) leven alleen in deze browsersessie en worden "
+                           "nergens opgeslagen.")
+if st.session_state.get("_db_fout"):
+    st.sidebar.caption(f"⚠️ Database niet bereikbaar — instellingen worden deze sessie niet "
+                       f"bewaard. ({st.session_state['_db_fout'][:80]})")
 
 st.sidebar.divider()
 st.sidebar.caption(
@@ -1764,8 +1847,13 @@ with tab_assistent:
                 st.rerun()
     else:
         # Dag-limiet: alleen als we JOUW backend-key gebruiken (elke vraag kost jou geld).
+        # Met een database is de teller per gebruiker en overleeft 'ie een herlaad.
         vandaag = pd.Timestamp.today().date().isoformat()
-        teller = st.session_state.setdefault("chat_teller", {})
+        _db_teller = bool(DB and HUIDIGE_GEBRUIKER)
+        if _db_teller:
+            teller = db_lees(HUIDIGE_GEBRUIKER, "chat_usage", {})
+        else:
+            teller = st.session_state.setdefault("chat_teller", {})
         gebruikt = teller.get(vandaag, 0)
         over_limiet = _via_backend and gebruikt >= CHAT_LIMIET_PER_DAG
         if _via_backend:
@@ -1812,7 +1900,10 @@ with tab_assistent:
                     antwoord = st.write_stream(_stroom())
                 st.session_state.chat_historie.append({"role": "assistant", "content": antwoord})
                 if _via_backend:  # alleen jouw key telt mee voor de limiet
-                    teller[vandaag] = gebruikt + 1
+                    if _db_teller:
+                        db_schrijf(HUIDIGE_GEBRUIKER, "chat_usage", {vandaag: gebruikt + 1})
+                    else:
+                        teller[vandaag] = gebruikt + 1
                     st.rerun()
             except Exception as e:
                 st.error(f"Kon de assistent niet bereiken: {e}")
