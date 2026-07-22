@@ -27,6 +27,93 @@ from portfolio import verwerk_transacties, koppel_corporate_actions
 
 st.set_page_config(page_title="Portfolio Tracker", page_icon="📈", layout="wide")
 
+
+# ---------- Multi-user: persoonlijke instellingen per sessie ----------
+# Lokaal (één gebruiker) gaan instellingen naar JSON-bestanden, zoals altijd.
+# In de cloud draaien meerdere mensen dezelfde app-instantie: dan zouden gedeelde
+# JSON-bestanden elkaars watchlist/doelgewichten/strategie/API-keys overschrijven.
+# Zet in Streamlit Cloud (app → Settings → Secrets) `multiuser = true` — dan leven
+# persoonlijke instellingen alléén in st.session_state (per browsersessie, niets
+# op schijf). Gedeelde marktdata-caches (ticker_mapping, info_cache) blijven wel
+# gedeeld: dat is geen persoonlijke informatie en delen is efficiënter.
+
+def _is_multiuser() -> bool:
+    try:
+        return bool(st.secrets.get("multiuser", False))
+    except Exception:  # geen secrets.toml aanwezig (lokaal)
+        return False
+
+
+MULTIUSER = _is_multiuser()
+
+_PREF_LEZERS = {
+    "strategie": marktdata.lees_strategie,
+    "doelgewichten": marktdata.lees_doelgewichten,
+    "koers_overrides": marktdata.lees_koers_overrides,
+    "watchlist": marktdata.lees_watchlist,
+    "config": marktdata.lees_config,
+}
+_PREF_STANDAARD = {"watchlist": list}
+
+
+def lees_pref(naam: str):
+    """Persoonlijke voorkeur: session_state (multi-user) of JSON (lokaal)."""
+    if MULTIUSER:
+        maak = _PREF_STANDAARD.get(naam, dict)
+        return st.session_state.setdefault(f"pref_{naam}", maak())
+    return _PREF_LEZERS[naam]()
+
+
+def pref_zet_strategie(isin: str, strategie: str) -> None:
+    if MULTIUSER:
+        lees_pref("strategie")[isin] = strategie
+    else:
+        marktdata.zet_strategie(isin, strategie)
+
+
+def pref_zet_doelgewichten(gewichten: dict) -> None:
+    if MULTIUSER:
+        schoon = {i: float(p) for i, p in gewichten.items() if p and float(p) > 0}
+        st.session_state["pref_doelgewichten"] = schoon
+    else:
+        marktdata.zet_doelgewichten(gewichten)
+
+
+def pref_zet_koers_override(isin: str, koers) -> None:
+    if MULTIUSER:
+        ov = lees_pref("koers_overrides")
+        if koers is None:
+            ov.pop(isin, None)
+        else:
+            ov[isin] = koers
+    else:
+        marktdata.zet_koers_override(isin, koers)
+
+
+def pref_voeg_watchlist(ticker: str) -> None:
+    if MULTIUSER:
+        wl = lees_pref("watchlist")
+        if ticker not in wl:
+            wl.append(ticker)
+    else:
+        marktdata.voeg_watchlist(ticker)
+
+
+def pref_verwijder_watchlist(ticker: str) -> None:
+    if MULTIUSER:
+        wl = lees_pref("watchlist")
+        if ticker in wl:
+            wl.remove(ticker)
+    else:
+        marktdata.verwijder_watchlist(ticker)
+
+
+def pref_zet_config(sleutel: str, waarde: str) -> None:
+    if MULTIUSER:
+        lees_pref("config")[sleutel] = waarde
+    else:
+        marktdata.zet_config(sleutel, waarde)
+
 GROEN = "#4ade80"
 ROOD = "#f87171"
 GRIJS = "#94a3b8"
@@ -326,6 +413,10 @@ if not transacties:
 
 st.sidebar.caption(f"{len(transacties)} transacties · {len(dividend_df)} dividenden "
                    f"({bron}).")
+if MULTIUSER:
+    st.sidebar.caption("🔒 **Gastmodus**: je CSV en instellingen (watchlist, doelgewichten, "
+                       "strategie, API-keys) leven alleen in deze browsersessie en worden "
+                       "nergens opgeslagen.")
 
 # ---------- Verwerken ----------
 
@@ -342,7 +433,7 @@ isin_naar_ticker, koersen, valutas, fx, product_info = laad_marktdata(unieke_isi
 
 posities, verkopen = verwerk_transacties(transacties)
 
-koers_overrides = marktdata.lees_koers_overrides()
+koers_overrides = lees_pref("koers_overrides")
 cache_sleutel = f"{len(transacties)}-{sorted(isin_naar_ticker.items())}-{sorted(koers_overrides.items())}"
 waarde_df, geprijsde_isins, prijzen_eur, dekking_df = laad_historie(
     transacties, cache_sleutel, isin_naar_ticker, koers_overrides)
@@ -392,7 +483,7 @@ totaal_hist = (waarde_serie + cash_hist) if (len(cash_hist) and not waarde_df.em
 externe = echte_stromen if heeft_account else stromen
 
 # Handmatige strategie-tags per positie (zelf in te stellen in de Data-tab).
-strategie_map = marktdata.lees_strategie()
+strategie_map = lees_pref("strategie")
 
 
 def koers_eur_nu(ticker) -> float | None:
@@ -678,7 +769,7 @@ with tab_portfolio:
         st.subheader("⚖️ Rebalancing")
         st.caption("Stel een doelgewicht (%) per positie in. Ik laat zien hoe ver je nu afwijkt "
                    "en welk bedrag je moet bij-/verkopen om je doelverdeling te bereiken.")
-        doelen = marktdata.lees_doelgewichten()
+        doelen = lees_pref("doelgewichten")
         with st.form("rebalancing"):
             nieuwe_doelen = {}
             for _, r in verdeling.iterrows():
@@ -694,7 +785,7 @@ with tab_portfolio:
             st.caption(f"Som van je doelgewichten: **{som_doel:.1f}%** "
                        f"{'✅' if abs(som_doel - 100) < 0.5 else '⚠️ (streef naar 100%)'}")
             if st.form_submit_button("💾 Doelgewichten opslaan", type="primary"):
-                marktdata.zet_doelgewichten(nieuwe_doelen)
+                pref_zet_doelgewichten(nieuwe_doelen)
                 st.success("Doelgewichten opgeslagen.")
                 st.rerun()
 
@@ -1472,7 +1563,7 @@ with tab_kalender:
 
     st.divider()
     st.subheader("🌍 Macro-economische events")
-    _fmp_key = marktdata.lees_config().get("fmp_api_key", "")
+    _fmp_key = lees_pref("config").get("fmp_api_key", "")
     macro = marktdata.macro_events_api(_fmp_key)
     macro_bron = "live via Financial Modeling Prep" if macro else "indicatieve lijst (bewerkbaar)"
     if not macro:
@@ -1487,7 +1578,7 @@ with tab_kalender:
         key_in = st.text_input("Financial Modeling Prep API-key", value=_fmp_key,
                                type="password", key="fmp_key_in")
         if st.button("Key opslaan", key="fmp_key_btn"):
-            marktdata.zet_config("fmp_api_key", key_in.strip())
+            pref_zet_config("fmp_api_key", key_in.strip())
             st.cache_data.clear()
             st.success("API-key opgeslagen. De live macro-agenda wordt nu opgehaald.")
             st.rerun()
@@ -1499,12 +1590,12 @@ with tab_watchlist:
     st.subheader("👁️ Watchlist")
     st.caption("Volg aandelen die je (nog) niet bezit. Voeg toe met hun Yahoo-ticker "
                "(bijv. `AAPL`, `ASML.AS`, `SHELL.L`).")
-    wl = marktdata.lees_watchlist()
+    wl = lees_pref("watchlist")
     wc1, wc2 = st.columns([4, 1])
     nieuw_wl = wc1.text_input("Ticker toevoegen", key="wl_add",
                               placeholder="bijv. NVDA of ADYEN.AS", label_visibility="collapsed")
     if wc2.button("➕ Toevoegen", key="wl_add_btn", use_container_width=True) and nieuw_wl.strip():
-        marktdata.voeg_watchlist(nieuw_wl)
+        pref_voeg_watchlist(nieuw_wl)
         st.rerun()
 
     if not wl:
@@ -1532,7 +1623,7 @@ with tab_watchlist:
                 st.plotly_chart(figw, use_container_width=True)
         weg = st.selectbox("Verwijderen uit watchlist", ["—"] + wl, key="wl_del")
         if st.button("🗑️ Verwijderen", key="wl_del_btn") and weg != "—":
-            marktdata.verwijder_watchlist(weg)
+            pref_verwijder_watchlist(weg)
             st.rerun()
         st.caption("Koersen ±15 min vertraagd (Yahoo Finance). Earnings-datum waar beschikbaar.")
 
@@ -1576,7 +1667,7 @@ with tab_assistent:
     st.caption("Stel vragen over je eigen portefeuille — bv. *welke positie drukt mijn "
                "rendement?*, *hoeveel dividend verwacht ik?*, *ben ik te geconcentreerd?* "
                "Antwoorden zijn gebaseerd op je geüploade data. Geen beleggingsadvies.")
-    _key = marktdata.lees_config().get("anthropic_api_key", "")
+    _key = lees_pref("config").get("anthropic_api_key", "")
     if anthropic is None:
         st.error("De `anthropic`-bibliotheek is niet geïnstalleerd in de venv "
                  "(`.venv\\Scripts\\python.exe -m pip install anthropic`).")
@@ -1585,7 +1676,7 @@ with tab_assistent:
         with st.expander("🔑 API-key instellen"):
             k = st.text_input("Anthropic API-key", type="password", key="anthropic_key_in")
             if st.button("Opslaan", key="anthropic_key_btn") and k.strip():
-                marktdata.zet_config("anthropic_api_key", k.strip())
+                pref_zet_config("anthropic_api_key", k.strip())
                 st.success("Opgeslagen.")
                 st.rerun()
     else:
@@ -1863,7 +1954,7 @@ with sub_data:
         key="strat_keuze",
     )
     if st.button("Strategie opslaan", type="primary", key="strat_opslaan"):
-        marktdata.zet_strategie(strat_isin, nieuwe_strat)
+        pref_zet_strategie(strat_isin, nieuwe_strat)
         st.success(f"Strategie voor {strat_isin} opgeslagen als '{nieuwe_strat}'. App herlaadt…")
         st.rerun()
 
@@ -1904,7 +1995,7 @@ with sub_data:
             if st.form_submit_button("💾 Overrides opslaan", type="primary"):
                 for isin, koers in nieuwe_ov.items():
                     # >0 = jouw handmatige koers; 0 = laat mijn schatting staan.
-                    marktdata.zet_koers_override(isin, koers if koers > 0 else None)
+                    pref_zet_koers_override(isin, koers if koers > 0 else None)
                 st.cache_data.clear()
                 st.success("Koersen opgeslagen. App herlaadt…")
                 st.rerun()

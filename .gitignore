@@ -1,5 +1,6 @@
 # Geheim — bevat je API-keys, NOOIT committen
 config.json
+.streamlit/secrets.toml
 
 # Lokale staat / caches (niet nodig in de repo)
 ticker_mapping.json
